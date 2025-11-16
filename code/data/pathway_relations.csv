@@ -1613,10 +1613,6 @@ Cocaine addiction,c00575,activation,prkaca*prkacb*prkacg
 Cocaine addiction,prkaca*prkacb*prkacg,activation,creb3*creb1*atf2*atf6b*creb3l4*atf4*creb3l2*creb3l3*creb3l1*creb5
 Cocaine addiction,creb3*creb1*atf2*atf6b*creb3l4*atf4*creb3l2*creb3l3*creb3l1*creb5,expression,pdyn
 Cocaine addiction,creb3*creb1*atf2*atf6b*creb3l4*atf4*creb3l2*creb3l3*creb3l1*creb5,expression,bdnf
-Collecting duct acid secretion,c00011,state change,c00011
-Collecting duct acid secretion,c00080,state change,c00080
-Collecting duct acid secretion,c00288,state change,c00288
-Collecting duct acid secretion,c00698,state change,c00698
 Cytokine-cytokine receptor interaction,gdf5,activation,bmpr1a*acvr2a
 Cytokine-cytokine receptor interaction,bmp7,activation,acvr2b*bmpr1b
 Cytokine-cytokine receptor interaction,ccl19,activation,ackr4

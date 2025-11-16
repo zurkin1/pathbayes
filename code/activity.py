@@ -1,5 +1,5 @@
 '''
-aximum flow treats the graph as a network:
+Maximum flow treats the graph as a network:
 - Each edge has a capacity (UDP expression level).
 - Sources are starting points; sinks are ending points.
 - Maximum flow computes the maximum amount of "signal" that can flow from source to sink.
@@ -78,7 +78,7 @@ def build_pathway_graph_structure(interactions):
                 continue
             
             shared_genes = set(int1['target']) & set(int2['source'])
-            if shared_genes:
+            if shared_genes and shared_genes != {''}:
                 # Store all genes that create this connection
                 if G.has_edge(int1['id'], int2['id']):
                     # Add to existing gene list
@@ -87,44 +87,31 @@ def build_pathway_graph_structure(interactions):
                     # Create new edge
                     G.add_edge(int1['id'], int2['id'], genes=shared_genes)
 
-    # Prune: keep only nodes on at least one source → sink path
     sources = [node for node in G.nodes if G.in_degree(node) == 0]
     sinks   = [node for node in G.nodes if G.out_degree(node) == 0]
-    if sources and sinks:
-        reachable_from_sources = set()
-        for s in sources:
-            reachable_from_sources |= nx.descendants(G, s) | {s}
-        
-        can_reach_sinks = set()
-        for t in sinks:
-            can_reach_sinks |= nx.ancestors(G, t) | {t}
-        
-        valid_nodes = reachable_from_sources & can_reach_sinks
-        if valid_nodes:
-            G = G.subgraph(valid_nodes).copy()
-
-    #Remove acycles to create DAG
-    while True:
-        try:
-            cycle = nx.find_cycle(G, orientation='original')
-            G.remove_edge(*cycle[0][:2])
-        except nx.exception.NetworkXNoCycle:
-            break
-
-    # Find top 20 longest paths using iterative removal
     corridors = []
-    G_temp = G.copy()
-    for _ in range(20):
-        try:
-            path = nx.dag_longest_path(G_temp)
-        except (nx.NetworkXError, nx.NetworkXNotImplemented):
-            break
-        if len(path) < 2:
-            break
-        corridors.append((path[0], path[-1]))
-        G_temp.remove_edges_from(list(zip(path, path[1:])))
-        if G_temp.number_of_edges() == 0:
-            break
+    if sources and sinks:
+        # Make temporary acyclic copy for longest path finding.
+        G_temp = G.copy()
+        while True:
+            try:
+                cycle = nx.find_cycle(G_temp, orientation='original')
+                G_temp.remove_edge(*cycle[0][:2])
+            except nx.exception.NetworkXNoCycle:
+                break
+        
+        # Find top 20 longest paths on the temporary DAG
+        for _ in range(20):
+            try:
+                path = nx.dag_longest_path(G_temp)
+            except (nx.NetworkXError, nx.NetworkXNotImplemented):
+                break
+            if len(path) < 2:
+                break
+            corridors.append((path[0], path[-1]))
+            G_temp.remove_edges_from(list(zip(path, path[1:])))
+            if G_temp.number_of_edges() == 0:
+                break
     
     G.graph['corridors'] = corridors
     return G
@@ -134,6 +121,28 @@ def is_inhibitory(interaction_type):
     """Check if interaction type is inhibitory"""
     inhibitory_keywords = ['inhibition', 'repression', 'dissociation', 'dephosphorylation', 'ubiquitination']
     return any(keyword in interaction_type.lower() for keyword in inhibitory_keywords)
+
+
+def shallow_fallback_activity(G, sample_udp):
+    """
+    Old-style node belief: gaussian scaling of sum(incoming UDP) and sum(outgoing UDP)
+    Returns average over nodes.
+    """
+    vals = []
+    for node in G.nodes:
+        src_genes = G.nodes[node].get("source_genes", [])
+        tgt_genes = G.nodes[node].get("target_genes", [])
+
+        src_sum = sum(sample_udp.get(g, 0.0) for g in src_genes)
+        tgt_sum = sum(sample_udp.get(g, 0.0) for g in tgt_genes)
+        tgt_sum = max(tgt_sum, 1e-10)
+
+        b = consistency_scaling(src_sum, tgt_sum)
+        if is_inhibitory(G.nodes[node].get("interaction_type", "")):
+            b = -b
+        vals.append(b)
+
+    return float(np.mean(vals)) if vals else 0.0
 
 
 def compute_pathway_flow(G, corridors, sample_udp):
@@ -147,9 +156,6 @@ def compute_pathway_flow(G, corridors, sample_udp):
     
     Returns the maximum flow value from supersource to supersink.
     """
-    if not corridors:
-        return 0.0
-    
     # Create a copy of the graph to add supersource/supersink
     G_flow = G.copy()
     
@@ -199,8 +205,8 @@ def process_sample(sample_udp: pd.Series):
 
     for pathway, G in PATHWAY_GRAPHS.items():
         corridors = G.graph.get('corridors', [])        
-        if not corridors:
-            activities[pathway] = 0.0
+        if len(corridors) < 2:
+            activities[pathway] = shallow_fallback_activity(G, sample_udp)
             continue
         
         # Compute flow for entire pathway at once
@@ -210,10 +216,10 @@ def process_sample(sample_udp: pd.Series):
     return activities
 
 
-def parallel_apply(df):
+def parallel_apply(df, pathway_interactions_dict):
     """Applies a function to DataFrame rows in parallel, preserving order."""
     n_cores = max(1, mp.cpu_count() - 2) # leave 2 cores free for OS
-    with mp.Pool(n_cores) as pool:
+    with mp.Pool(n_cores, initializer=init_pathway_graphs, initargs=(pathway_interactions_dict,)) as pool:
         results = list(
             tqdm(
                 pool.imap(process_sample, (row for _, row in df.iterrows())),
@@ -226,31 +232,31 @@ def parallel_apply(df):
 PATHWAY_GRAPHS = {}
 
 
-if __name__ == '__main__':
-    # Use fork on Linux it's faster and handles complex objects
-    #if mp.get_start_method(allow_none=True) != 'fork':
-    #    mp.set_start_method('fork', force=True)
-    # Initialize graph structures. Built once at module load, reused for all samples.
-    pathway_interactions = parse_pathway_interactions('./data/pathway_relations.csv')
-
-    print("Building pathway graph structures...")
+def init_pathway_graphs(pathway_interactions):
+    global PATHWAY_GRAPHS
     for pathway, interactions in pathway_interactions.items():
         PATHWAY_GRAPHS[pathway] = build_pathway_graph_structure(interactions)
-    print(f"Built {len(PATHWAY_GRAPHS)} pathway graphs")
-    
+    #print(f"Built {len(PATHWAY_GRAPHS)} pathway graphs")
+
+
+if __name__ == '__main__':
+    # Initialize graph structures.
+    pathway_interactions = parse_pathway_interactions('./data/pathway_relations.csv')
+    init_pathway_graphs(pathway_interactions)
     udp_df = pd.read_csv('./data/TCGACRC_expression-merged.zip', sep='\t', index_col=0)
     udp_df.index = udp_df.index.str.lower()
 
     DEBUG=False
     if DEBUG:
-        for col in udp_df.columns:
-            print(f"Processing sample {col}...")
+        results_all = []
+        for col in tqdm(udp_df.columns):
             result = process_sample(udp_df[col])
-        exit(0)
-   
-    df_to_process = udp_df.T
-    print(f"Processing {len(df_to_process)} samples...")
-    results = parallel_apply(df_to_process).T
+            results_all.append(result)
+        results = pd.DataFrame(results_all, index=udp_df.columns).T
+    else:
+        df_to_process = udp_df.T
+        print(f"Processing {len(df_to_process)} samples...")
+        results = parallel_apply(df_to_process, pathway_interactions).T
     results = results.round(4)
     results.to_csv('./data/output_activity.csv')
     print(f"Saved results to ./data/output_activity.csv")
